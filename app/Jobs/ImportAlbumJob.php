@@ -1,8 +1,8 @@
 <?php
 namespace App\Jobs;
 
-use App\Services\SpotifyClient;
-use App\Services\SpotifyImporter;
+use App\services\SpotifyClient;
+use App\services\SpotifyImporter;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;

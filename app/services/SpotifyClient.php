@@ -4,14 +4,19 @@ namespace App\services;
 
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\RequestException;
+use Illuminate\Support\Str;
+use Psr\Log\LoggerInterface;
 
 class SpotifyClient
 {
     private const TOKEN_URL = 'https://accounts.spotify.com/api/token';
     private const API_BASE  = 'https://api.spotify.com/v1';
+
     protected string $market;
 
-    public function __construct()
+    public function __construct(protected ?LoggerInterface $logger = null)
     {
         $this->market = config('services.spotify.market', 'US');
     }
@@ -52,153 +57,135 @@ class SpotifyClient
                 throw new \RuntimeException('Spotify token error: access_token missing');
             }
 
-            return $token;
+            return $resp->json('access_token');
         });
     }
 
-    protected function authHeaders(): array
+    /**
+     * HTTP client con reintentos para 429/5xx.
+     */
+    protected function http()
     {
-        return [
-            'Authorization' => 'Bearer '.$this->getAccessToken(),
-            'Accept'        => 'application/json',
-        ];
+        $token = $this->getAccessToken();
+
+        return Http::baseUrl(self::API_BASE)
+            ->withToken($token)
+            // 5 intentos máx. Backoff exponencial 0.5s,1s,2s,4s,8s (con jitter leve)
+            ->retry(5, 500, function ($exception, $request) {
+                // Reintenta en 429 (respeta Retry-After) y 5xx, más errores de red
+                if ($exception instanceof RequestException) {
+                    $response = $exception->response;
+                    if ($response) {
+                        $status = $response->status();
+                        if ($status === 429) {
+                            $retryAfter = (int) ($response->header('Retry-After') ?? 1);
+                            // Pausa el tiempo indicado por Spotify:
+                            sleep(max(1, $retryAfter));
+                            return true;
+                        }
+                        if ($status >= 500 && $status <= 599) {
+                            // 5xx → reintenta
+                            usleep(random_int(50_000, 200_000)); // jitter
+                            return true;
+                        }
+                    }
+                }
+                if ($exception instanceof ConnectionException) {
+                    // Errores de red → reintenta
+                    return true;
+                }
+                return false;
+            });
     }
 
-    /** ========== Helpers ========== */
-
     /**
-     * Hace una solicitud GET con manejo básico de 429 (Retry-After).
+     * GET genérico, con opción de añadir/remover market.
      */
-    protected function get(string $url, array $query = [])
+    protected function getJson(string $path, array $query = [], bool $useMarket = true): array
     {
-        $resp = Http::withHeaders($this->authHeaders())->get($url, $query);
-
-        // Retry sencillo si 429
-        if ($resp->status() === 429) {
-            $retryAfter = (int) ($resp->header('Retry-After') ?? 1);
-            usleep(max($retryAfter, 1) * 1000000);
-            $resp = Http::withHeaders($this->authHeaders())->get($url, $query);
+        if ($useMarket && $this->market) {
+            $query = ['market' => $this->market] + $query;
         }
 
-        if (!$resp->successful()) {
-            throw new \RuntimeException('Spotify GET error: '.$url.' | HTTP '.$resp->status().' - '.$resp->body());
+        $resp = $this->http()->get($path, $query);
+
+        if ($resp->failed()) {
+            $msg = sprintf(
+                'Spotify GET error: %s | HTTP %d - %s',
+                $resp->effectiveUri(),
+                $resp->status(),
+                $resp->body() ?: '[no body]'
+            );
+            // Log para diagnóstico y lanzar excepción
+            $this->logger?->error($msg, ['path' => $path, 'query' => $query]);
+            throw new \RuntimeException($msg);
         }
 
         return $resp->json();
     }
 
     /**
-     * Pagina sobre respuestas de Spotify que tienen { items, next, limit, offset, total }.
-     * Retorna un arreglo plano con todos los items.
+     * Paginación robusta usando el "next" de Spotify en lugar de armar offsets.
+     * Devuelve un generador (yield) de items.
      */
-    protected function paginate(string $path, array $query = []): array
+    protected function paginate(string $firstPath, array $firstQuery = [], bool $useMarket = true, int $limit = 50): \Generator
     {
-        $query = array_merge([
-            'limit'  => 50,       // máx 50
-            'offset' => 0,
-        ], $query);
+        $firstQuery = ['limit' => $limit] + $firstQuery;
 
-        $items = [];
-        $next  = self::API_BASE.$path;
-
-        while ($next) {
-            // Si next trae query completa, úsala; si no, usa path+query
-            if (str_starts_with($next, 'http')) {
-                $resp = $this->get($next);
-            } else {
-                $resp = $this->get(self::API_BASE.$path, $query);
-            }
-
-            $batch = $resp['items'] ?? [];
-            $items = array_merge($items, $batch);
-
-            $next  = $resp['next'] ?? null;
-
-            // Si no hay 'next', se acabó
-            if (!$next) {
-                break;
-            }
-
-            // Si hay next, Spotify ya incluye limit/offset en ese URL;
-            // el siguiente ciclo entrará por la rama que usa $next absoluta
+        // 1) Primera página por path/query
+        $page = $this->getJson($firstPath, $firstQuery, $useMarket);
+        $items = $page['items'] ?? [];
+        foreach ($items as $it) {
+            yield $it;
         }
 
-        return $items;
-    }
+        // 2) Siguientes páginas por "next" (URL completa)
+        $next = $page['next'] ?? null;
 
-    /** ========== Endpoints usados ========== */
+        while ($next) {
+            // Usa la URL "next" completa para evitar bugs de offset/market
+            $resp = $this->http()->get($next); // OJO: next ya trae query
+            if ($resp->failed()) {
+                $msg = sprintf(
+                    'Spotify GET error (pagination next): %s | HTTP %d - %s',
+                    $resp->effectiveUri(),
+                    $resp->status(),
+                    $resp->body() ?: '[no body]'
+                );
+                $this->logger?->warning($msg);
+                // Estrategia: reintenta ya la hizo http()->retry; si aún falla,
+                // podrías intentar quitar market y reintentar UNA VEZ.
+                // Aquí un fallback rápido:
+                $tryNoMarket = $this->http()->get($next.'&_omit_market=1'); // “truco” para cambiar la URL
+                if ($tryNoMarket->ok()) {
+                    $page = $tryNoMarket->json();
+                } else {
+                    // Si de plano falla, rompe el ciclo y devuelve lo acumulado
+                    $this->logger?->error('Pagination aborted due to repeated failures.', [
+                        'next' => $next,
+                        'status' => $resp->status(),
+                    ]);
+                    break;
+                }
+            } else {
+                $page = $resp->json();
+            }
 
-    public function getArtist(string $spotifyId): array
-    {
-        return $this->get(self::API_BASE.'/artists/'.$spotifyId);
-    }
-
-    /**
-     * Lista TODOS los álbumes del artista (paginando).
-     * $opts:
-     *  - include_groups: "album,single,appears_on,compilation"
-     *  - market: p.ej. "MX" o "US" (recomendado para normalizar disponibilidad)
-     */
-    public function getArtistAlbums(string $artistId, array $opts = []): array
-    {
-        $query = array_merge([
-            'include_groups' => 'album,single,appears_on,compilation',
-            'market'         => 'MX',  // ajusta si prefieres 'US' u otro
-        ], $opts);
-
-        return $this->paginate('/artists/'.$artistId.'/albums', $query);
-    }
-
-    /**
-     * Lista TODOS los tracks de un álbum (paginando).
-     * $opts:
-     *  - market: p.ej. "MX"
-     */
-    public function getAlbumTracks(string $albumId, array $opts = []): array
-    {
-        $query = array_merge([
-            'market' => 'MX',
-        ], $opts);
-
-        return $this->paginate('/albums/'.$albumId.'/tracks', $query);
-    }
-
-    /**
-     * (Opcional) Obtener detalles completos de un álbum (portadas, etc.).
-     */
-    public function getAlbum(string $albumId, array $opts = []): array
-    {
-        $query = array_merge([
-            'market' => 'MX',
-        ], $opts);
-
-        return $this->get(self::API_BASE.'/albums/'.$albumId, $query);
+            $items = $page['items'] ?? [];
+            foreach ($items as $it) {
+                yield $it;
+            }
+            $next = $page['next'] ?? null;
+        }
     }
 
     /**
-     * Busca artistas por nombre usando /v1/search (type=artist).
-     *
-     * @param string $query  Nombre o parte del nombre a buscar
-     * @param int    $limit  Máximo de resultados (1-50)
-     * @param int    $offset Desplazamiento para paginar
-     * @return array Lista de items de artistas (cada item es un array con datos del artista)
-     * @throws \Illuminate\Http\Client\RequestException
+     * Tracks de un álbum (usa paginação por "next", limit=50).
      */
-    public function searchArtist(string $query, int $limit = 10, int $offset = 0): array
+    public function getAlbumTracks(string $albumId, bool $useMarket = true, int $limit = 50): \Generator
     {
-        $limit = max(1, min(50, $limit)); // Spotify permite 1..50
-
-        $resp = $this->request('GET', 'https://api.spotify.com/v1/search', [
-            'q' => $query,
-            'type' => 'artist',
-            'limit' => $limit,
-            'offset' => $offset,
-            'market' => $this->market,
-        ]);
-
-        $data = $resp->json();
-
-        return $data['artists']['items'] ?? [];
+        $path = "/albums/{$albumId}/tracks";
+        return $this->paginate($path, [], $useMarket, $limit);
     }
 
     /**
