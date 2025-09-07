@@ -3,8 +3,8 @@
 namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
-use App\Services\SpotifyClient;
-use App\Services\SpotifyImporter;
+use App\services\SpotifyClient;
+use App\services\SpotifyImporter;
 
 class SpotifySmoke extends Command
 {
