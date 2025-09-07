@@ -3,7 +3,7 @@
 namespace App\Console\Commands;
 
 use App\Jobs\ImportArtistJob;
-use App\services\SpotifyClient;
+use App\Services\SpotifyClient;
 use Illuminate\Console\Command;
 
 class SpotifySearchArtist extends Command
