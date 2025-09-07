@@ -82,6 +82,16 @@ MAIL_ENCRYPTION=tls
 MAIL_FROM_ADDRESS=no-reply@algoritmoflow.test
 MAIL_FROM_NAME="AlgoritmoFlow"
 ```
+In your `.env`, set up mail credentials:
+
+```dotenv
+# Spotify API settings
+SPOTIFY_CLIENT_ID=YOUR_SPOTIFY_CLIENT_ID
+SPOTIFY_CLIENT_SECRET=YOUR_SPOTIFY_CLIENT_SECRET
+SPOTIFY_MARKET=MX        # mercado preferido para releases/tracks
+SPOTIFY_RATE_LIMIT_QPS=8 # requests/seguro (ajustable)
+SPOTIFY_ARTIST_ID=YOUR_SPOTIFY_ARTIST_ID
+```
 
 For development, you can log emails instead of sending:
 
