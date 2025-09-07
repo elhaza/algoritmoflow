@@ -34,5 +34,14 @@ return [
             'channel' => env('SLACK_BOT_USER_DEFAULT_CHANNEL'),
         ],
     ],
+    'spotify' => [
+        'client_id'      => env('SPOTIFY_CLIENT_ID'),
+        'client_secret'  => env('SPOTIFY_CLIENT_SECRET'),
+        'market'         => env('SPOTIFY_MARKET', 'MX'),
+        'rate_limit_qps' => env('SPOTIFY_RATE_LIMIT_QPS', 8),
+        'artist_id'      => env('SPOTIFY_ARTIST_ID'),
+    ],
+
+
 
 ];
